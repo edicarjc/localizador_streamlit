@@ -523,4 +523,4 @@ with tab3:
 
 # Rodapé com informações do desenvolvedor
 st.markdown("---")
-st.markdown("<div style='text-align:center;'>Desenvolvido por Edmilson Carvalho, Edmilson.carvalho@globalhitss.com.br, © 2025</div>", unsafe_allow_html=True)
+st.markdown("<div style='text-align:center;'>Desenvolvido por Edmilson Carvalho - Edmilson.carvalho@globalhitss.com.br © 2025</div>", unsafe_allow_html=True)
