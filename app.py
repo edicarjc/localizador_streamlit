@@ -6,7 +6,7 @@ import io
 import plotly.express as px
 import pydeck as pdk
 
-# Injeta CSS personalizado para design responsivo e um visual mais limpo
+# --- INJEÇÃO DE CSS ---
 st.markdown("""
 <style>
     /* Esconde o menu do Streamlit e o rodapé "Made with Streamlit" */
@@ -42,10 +42,9 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # --- FUNÇÕES ---
+
 def get_distance_matrix(origins, destinations, api_key):
-    """
-    Obtém a matriz de distância de carro do Google Maps.
-    """
+    """Obtém a matriz de distância de carro do Google Maps."""
     url = "https://maps.googleapis.com/maps/api/distancematrix/json"
     params = {
         "origins": "|".join(origins),
@@ -59,9 +58,7 @@ def get_distance_matrix(origins, destinations, api_key):
     return data
 
 def geocodificar_endereco(endereco, api_key):
-    """
-    Converte um endereço em coordenadas (latitude e longitude).
-    """
+    """Converte um endereço em coordenadas (latitude e longitude)."""
     url = "https://maps.googleapis.com/maps/api/geocode/json"
     params = {
         "address": endereco,
@@ -80,9 +77,7 @@ def geocodificar_endereco(endereco, api_key):
 
 @st.cache_data
 def load_data(file_path):
-    """
-    Carrega os dados do arquivo Excel e faz um cache para otimizar o desempenho.
-    """
+    """Carrega os dados do arquivo Excel e faz um cache para otimizar o desempenho."""
     try:
         df = pd.read_excel(file_path)
         return df
@@ -95,9 +90,8 @@ def load_data(file_path):
     return None
 
 def encontrar_tecnico_proximo(endereco_cliente, api_key, df_filtrado):
-    """
-    Encontra os técnicos mais próximos a um endereço de cliente.
-    """
+    """Encontra os técnicos mais próximos a um endereço de cliente, limitando a 200 km."""
+    
     df_filtrado['latitude'] = pd.to_numeric(df_filtrado['latitude'], errors='coerce')
     df_filtrado['longitude'] = pd.to_numeric(df_filtrado['longitude'], errors='coerce')
     df_validos = df_filtrado.dropna(subset=['latitude', 'longitude']).copy()
@@ -148,12 +142,14 @@ def encontrar_tecnico_proximo(endereco_cliente, api_key, df_filtrado):
 
     df_validos["distancia_km"] = distancias_finais
     
-    return df_validos.sort_values("distancia_km").head(10), localizacao_cliente
+    # --- FILTRO DE 200 KM ---
+    df_dentro_limite = df_validos[df_validos["distancia_km"] <= 200]
+    
+    # Retorna todos os técnicos dentro do limite, ordenados pela distância
+    return df_dentro_limite.sort_values("distancia_km"), localizacao_cliente
 
 
 # --- LÓGICA DE LOGIN PRINCIPAL ---
-if "authenticated" not in st.session_state:
-    st.session_state.authenticated = False
 
 def check_password_main():
     """Verifica se a senha principal do usuário corresponde à senha secreta."""
@@ -165,7 +161,14 @@ def check_password_main():
     elif password:
         st.error("Senha incorreta. Tente novamente.")
 
+# --- INÍCIO DA EXECUÇÃO ---
+
+if "authenticated" not in st.session_state:
+    st.session_state.authenticated = False
+
+# BLOCO DE LOGIN
 if not st.session_state.authenticated:
+    st.set_page_config(page_title="Localizador de Técnicos", layout="wide")
     st.title("🔒 Acesso Restrito")
     check_password_main()
     st.stop()
@@ -177,19 +180,27 @@ st.set_page_config(page_title="Localizador de Técnicos", layout="wide")
 st.title("🔎 Localizador de Técnicos")
 st.markdown("---")
 
+# 1. CARREGAR DADOS E API KEY
 df_tecnicos = load_data('tecnicos.xlsx')
 if df_tecnicos is None:
     st.stop()
 
+# 2. CENTRALIZAÇÃO DA CHAVE DE API
+try:
+    API_KEY = st.secrets["api"]["google_maps"]
+except KeyError:
+    st.error("Chave de API do Google Maps não encontrada. Verifique o arquivo .streamlit/secrets.toml")
+    API_KEY = None
+    
 # --- CONVERTER COLUNAS DE COORDENADAS PARA NUMÉRICO ---
 df_tecnicos['latitude'] = pd.to_numeric(df_tecnicos['latitude'], errors='coerce')
 df_tecnicos['longitude'] = pd.to_numeric(df_tecnicos['longitude'], errors='coerce')
 # -----------------------------------------------------------------
 
-# --- FILTROS DE BUSCA NA BARRA LATERAL ---
+# --- CONFIGURAÇÃO INICIAL DO SIDEBAR ---
 st.sidebar.header("Filtros de Busca")
 ufs = ["Todos"] + sorted(df_tecnicos['uf'].unique().tolist())
-cidades = ["Todas"] + sorted(df_tecnicos['cidade'].unique().tolist())
+cidades_todas = ["Todas"] + sorted(df_tecnicos['cidade'].unique().tolist()) # Lista completa
 coordenadores = ["Todos"] + sorted(df_tecnicos['coordenador'].unique().tolist())
 
 if "uf_selecionada" not in st.session_state:
@@ -199,15 +210,50 @@ if "cidade_selecionada" not in st.session_state:
 if "coordenador_selecionado" not in st.session_state:
     st.session_state.coordenador_selecionado = "Todos"
 
+# --- SIDEBAR (COM FILTRO DINÂMICO DE CIDADES) ---
 with st.sidebar:
-    st.session_state.uf_selecionada = st.selectbox("Filtrar por UF:", ufs, index=ufs.index(st.session_state.uf_selecionada))
-    if st.session_state.uf_selecionada and st.session_state.uf_selecionada != "Todos":
-        cidades_filtradas = ["Todas"] + sorted(df_tecnicos[df_tecnicos['uf'] == st.session_state.uf_selecionada]['cidade'].unique().tolist())
-        st.session_state.cidade_selecionada = st.selectbox("Filtrar por Cidade:", cidades_filtradas, index=cidades_filtradas.index(st.session_state.cidade_selecionada) if st.session_state.cidade_selecionada in cidades_filtradas else 0)
-    else:
-        st.session_state.cidade_selecionada = st.selectbox("Filtrar por Cidade:", cidades, index=cidades.index(st.session_state.cidade_selecionada) if st.session_state.cidade_selecionada in cidades else 0)
     
-    st.session_state.coordenador_selecionado = st.selectbox("Filtrar por Coordenador:", coordenadores, index=coordenadores.index(st.session_state.coordenador_selecionado) if st.session_state.coordenador_selecionado in coordenadores else 0)
+    # 1. Filtro por UF
+    st.session_state.uf_selecionada = st.selectbox(
+        "Filtrar por UF:", 
+        ufs, 
+        index=ufs.index(st.session_state.uf_selecionada)
+    )
+
+    # 2. Lógica para filtrar as cidades com base na UF selecionada
+    if st.session_state.uf_selecionada and st.session_state.uf_selecionada != "Todos":
+        # Cria a lista de cidades com base na UF selecionada
+        cidades_filtradas = ["Todas"] + sorted(
+            df_tecnicos[df_tecnicos['uf'] == st.session_state.uf_selecionada]['cidade'].unique().tolist()
+        )
+        
+        # Encontra o índice da cidade selecionada na nova lista, ou volta para "Todas" (índice 0) se não existir
+        try:
+            current_index = cidades_filtradas.index(st.session_state.cidade_selecionada)
+        except ValueError:
+            current_index = 0
+            st.session_state.cidade_selecionada = "Todas" # Reseta o estado se a cidade não está mais disponível
+    
+        # Exibe o Selectbox de Cidade com a lista filtrada
+        st.session_state.cidade_selecionada = st.selectbox(
+            "Filtrar por Cidade:", 
+            cidades_filtradas, 
+            index=current_index
+        )
+    else:
+        # Se UF = "Todos", exibe a lista completa de cidades
+        st.session_state.cidade_selecionada = st.selectbox(
+            "Filtrar por Cidade:", 
+            cidades_todas,
+            index=cidades_todas.index(st.session_state.cidade_selecionada) if st.session_state.cidade_selecionada in cidades_todas else 0
+        )
+    
+    # 3. Filtro por Coordenador (Mantido inalterado)
+    st.session_state.coordenador_selecionado = st.selectbox(
+        "Filtrar por Coordenador:", 
+        coordenadores, 
+        index=coordenadores.index(st.session_state.coordenador_selecionado) if st.session_state.coordenador_selecionado in coordenadores else 0
+    )
 
     st.markdown("---")
     if st.button("Limpar Filtros"):
@@ -219,6 +265,7 @@ with st.sidebar:
     st.markdown("---")
     st.markdown("**Opções de Visualização**")
     modo_exibicao = st.radio("Formato da Lista de Técnicos:", ["Tabela", "Colunas"], index=1)
+# --------------------------------------------------------------------------
 
 # --- Sistema de abas ---
 tab1, tab2, tab3 = st.tabs(["Localizador de Técnicos", "Análise de Dados", "Editor de Dados"])
@@ -252,11 +299,11 @@ with tab1:
     st.markdown("---")
     st.header("Busca por Distância")
 
-    try:
-        API_KEY = st.secrets["api"]["google_maps"]
-    except KeyError:
-        st.error("Chave de API do Google Maps não encontrada. Verifique o arquivo .streamlit/secrets.toml")
-        API_KEY = None
+    # AVISO DE FILTRO E RESTRIÇÃO DE 200KM
+    if not df_filtrado.empty:
+        st.info(f"A busca será restrita aos **{len(df_filtrado)}** técnicos selecionados e **apenas técnicos a até 200 km** serão listados.")
+    else:
+        st.warning("Não há técnicos nos filtros selecionados para realizar a busca por distância.")
 
     if API_KEY:
         endereco_cliente = st.text_input("Endereço / CEP / Cidade", help="Ex: Av. Paulista, 1000, São Paulo, SP ou 01310-100 ou São Paulo")
@@ -264,10 +311,11 @@ with tab1:
         if st.button("Buscar Técnico Mais Próximo"):
             if endereco_cliente:
                 with st.spinner("Buscando o técnico mais próximo..."):
+                    # A função já aplica a restrição de 200 km
                     tecnicos_proximos, localizacao_cliente = encontrar_tecnico_proximo(endereco_cliente, API_KEY, df_filtrado)
                     
                     if tecnicos_proximos is not None and not tecnicos_proximos.empty:
-                        st.success("Busca concluída!")
+                        st.success(f"Busca concluída! Encontrados {len(tecnicos_proximos)} técnicos a até 200 km de distância.")
                         
                         st.subheader("📍 Mapa dos Resultados (Google Maps)")
                         
@@ -278,6 +326,7 @@ with tab1:
                         
                         cliente_coords = {'lat': localizacao_cliente['lat'], 'lng': localizacao_cliente['lng']}
                         
+                        # CÓDIGO HTML DO MAPA
                         map_html = f"""
                         <!DOCTYPE html>
                         <html>
@@ -324,8 +373,9 @@ with tab1:
                         """
                         components.html(map_html, height=550)
 
-                        st.markdown("<h3 style='text-align: center;'>Top 10 Técnicos Mais Próximos</h3>", unsafe_allow_html=True)
+                        st.markdown("<h3 style='text-align: center;'>Técnicos (Até 200 km)</h3>", unsafe_allow_html=True)
                         
+                        # Preparação para exportação
                         df_to_export = tecnicos_proximos[['tecnico', 'coordenador', 'cidade', 'uf', 'distancia_km', 'email_coordenador']].copy()
                         df_to_export['distancia_km'] = df_to_export['distancia_km'].round(2)
                         df_to_export.rename(columns={
@@ -348,12 +398,14 @@ with tab1:
                         )
 
                         cols = st.columns(2)
+                        # O i neste loop não representa a ordem, mas apenas a contagem para as colunas
                         for i, row in tecnicos_proximos.iterrows():
                             with cols[i % 2]:
-                                st.markdown(f"**{i+1}. {row['tecnico']}**")
+                                # EXIBIÇÃO CORRIGIDA: Distância movida para após a cidade
+                                st.markdown(f"**{row['tecnico']}**")
                                 st.write(f"Coordenador: {row.get('coordenador', 'Não informado')}")
                                 st.write(f"Cidade: {row.get('cidade', 'Não informada')}")
-                                st.write(f"Distância: {row['distancia_km']:.2f} km")
+                                st.write(f"Distância: **{row['distancia_km']:.2f} km**") 
                                 
                                 email_coordenador = row.get('email_coordenador')
                                 if email_coordenador:
@@ -367,16 +419,16 @@ with tab1:
                                         """, 
                                         unsafe_allow_html=True
                                     )
-                                        
+                                    
                                 st.markdown("---")
 
                     else:
-                        st.info("Nenhum técnico encontrado para os filtros e o local informados.")
+                        st.info("Nenhum técnico encontrado no universo filtrado que esteja a até 200 km de distância do endereço.")
             else:
                 st.warning("Por favor, digite um endereço para iniciar a busca.")
 
 with tab2:
-    # --- DASHBOARD DE ESTATÍSTICAS NA ABA PRÓPRIA ---
+    # --- DASHBOARD DE ESTATÍSTICAS ---
     st.header("📊 Análise de Dados dos Técnicos")
     
     col1, col2, col3 = st.columns(3)
@@ -406,14 +458,13 @@ with tab2:
 
     st.markdown("---")
 
-    # Gráfico de barras para técnicos por UF
+    # Gráficos
     st.subheader("Gráfico: Técnicos por UF")
     uf_counts = df_tecnicos['uf'].value_counts().reset_index()
     uf_counts.columns = ['UF', 'Quantidade']
     fig_uf = px.bar(uf_counts, x='UF', y='Quantidade', title="Técnicos por UF", color='UF')
     st.plotly_chart(fig_uf, use_container_width=True)
     
-    # Gráfico de barras para técnicos por Coordenador
     st.subheader("Gráfico: Técnicos por Coordenador")
     coordenador_counts = df_tecnicos['coordenador'].value_counts().reset_index()
     coordenador_counts.columns = ['Coordenador', 'Quantidade']
@@ -483,7 +534,7 @@ with tab3:
         check_password_editor()
     else:
         st.subheader("📝 Editor de Dados dos Técnicos")
-        st.info("Clique duas vezes em uma célula para editar. Use o menu lateral para adicionar ou remover linhas.")
+        st.info("Clique duas vezes em uma célula para editar. Use o menu lateral para adicionar ou remover linhas. **Lembre-se: as alterações não são salvas permanentemente no repositório!**")
 
         if "df_editavel" not in st.session_state:
             st.session_state.df_editavel = df_tecnicos.copy()
@@ -495,21 +546,32 @@ with tab3:
         st.markdown("---")
         st.subheader("Atualizar e Salvar Alterações")
         
-        API_KEY = st.secrets["api"]["google_maps"]
+        # AQUI USAMOS A VARIÁVEL API_KEY CENTRALIZADA
         if st.button("Atualizar Coordenadas", help="Preenche Latitude e Longitude de novos endereços."):
-            with st.spinner("Atualizando coordenadas..."):
-                for index, row in st.session_state.df_editavel.iterrows():
-                    if ('endereco' in df_editavel.columns and str(row.get('endereco', '')) != str(df_tecnicos.loc[index]['endereco'])) or pd.isnull(row['latitude']) or pd.isnull(row['longitude']):
-                        endereco_completo = f"{row.get('endereco', '')}, {row.get('cidade', '')}"
-                        lat, lng = geocodificar_endereco(endereco_completo, API_KEY)
-                        
-                        if lat is not None and lng is not None:
-                            st.session_state.df_editavel.at[index, 'latitude'] = lat
-                            st.session_state.df_editavel.at[index, 'longitude'] = lng
-                            st.success(f"Coordenadas de **{row['tecnico']}** atualizadas com sucesso!")
-                        else:
-                            st.warning(f"Não foi possível encontrar as coordenadas de **{row['tecnico']}**.")
-                st.rerun()
+            if API_KEY:
+                with st.spinner("Atualizando coordenadas..."):
+                    for index, row in st.session_state.df_editavel.iterrows():
+                        # Lógica para atualizar a coordenada se o endereço mudou ou se as coordenadas estiverem vazias
+                        if ('endereco' in df_editavel.columns and (str(row.get('endereco', '')) != str(df_tecnicos.loc[index]['endereco']) or pd.isnull(row['latitude']) or pd.isnull(row['longitude']))):
+                            
+                            endereco_completo = f"{row.get('endereco', '')}, {row.get('cidade', '')}"
+                            lat, lng = geocodificar_endereco(endereco_completo, API_KEY)
+                            
+                            if lat is not None and lng is not None:
+                                st.session_state.df_editavel.at[index, 'latitude'] = lat
+                                st.session_state.df_editavel.at[index, 'longitude'] = lng
+                                st.success(f"Coordenadas de **{row['tecnico']}** atualizadas com sucesso!")
+                            else:
+                                st.warning(f"Não foi possível encontrar as coordenadas de **{row['tecnico']}**.")
+                    st.rerun()
+            else:
+                 st.error("A Chave da API do Google Maps é necessária para esta função.")
+
+
+        # Alerta para o usuário sobre a necessidade de upload manual (USANDO ASPAS TRIPLAS PARA EVITAR ERROS)
+        st.markdown("""
+        <p style='color:red;'>ATENÇÃO: Este botão apenas baixa o arquivo. Você deve carregá-lo manualmente no GitHub para manter as alterações!</p>
+        """, unsafe_allow_html=True)
 
         towrite_edit = io.BytesIO()
         st.session_state.df_editavel.to_excel(towrite_edit, index=False, header=True)
