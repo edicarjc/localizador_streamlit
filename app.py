@@ -379,6 +379,7 @@ def processar_chamados_em_lote(df_chamados, df_tecnicos_base, api_key, max_dista
 
 def check_password_general(password_key, error_msg, key_input):
     """Verifica uma senha genérica do secrets, usando uma chave única para o input."""
+    # Se a chave de senha não existir nos secrets (ex: deploy local sem secrets), permite o acesso
     if password_key not in st.secrets.get("auth", {}):
         return True 
     
@@ -397,11 +398,13 @@ if "authenticated" not in st.session_state:
     st.session_state.authenticated = False
 if "editor_authenticated" not in st.session_state:
     st.session_state.editor_authenticated = False
+if "lote_authenticated" not in st.session_state:
+    st.session_state.lote_authenticated = False # NOVO ESTADO DE AUTENTICAÇÃO
 if "raio_selecionado" not in st.session_state:
     st.session_state.raio_selecionado = 30 
 
 
-# BLOCO DE LOGIN
+# BLOCO DE LOGIN GERAL
 if not st.session_state.authenticated:
     st.title("🔒 Acesso Restrito")
     # Usa a função generalizada
@@ -853,10 +856,23 @@ with tab3:
 
 
 # =========================================================================
-# === ABA: ANÁLISE DE CHAMADOS EM LOTE === (NOVA ABA)
+# === ABA: ANÁLISE DE CHAMADOS EM LOTE === (NOVA ABA COM AUTENTICAÇÃO)
 # =========================================================================
 with tab4:
     st.title("Análise de Chamados em Lote")
+
+    # --- NOVO BLOCO DE AUTENTICAÇÃO PARA A ABA DE LOTE ---
+    if not st.session_state.lote_authenticated:
+        st.header("🔒 Acesso Restrito ao Processamento em Lote")
+        st.warning("Esta seção consome cotas da API do Google Maps. É necessária a mesma senha do Editor para acesso.")
+        # Usa a senha do editor ("editor_senha") para autenticar o acesso à aba de lote
+        if check_password_general("editor_senha", "Senha do Editor/Lote incorreta. Tente novamente.", "lote_auth_input"):
+            st.session_state.lote_authenticated = True
+            st.rerun() 
+        st.stop()
+    # --- FIM DO BLOCO DE AUTENTICAÇÃO ---
+
+    
     st.header("Confrontar Planilha de Chamados com Base de Técnicos")
     st.warning(f"Custo de Distância por KM: R$ {CUSTO_POR_KM:.2f} (Considerando ida e volta). Este recurso consome cotas da Google Maps API rapidamente. A otimização por distância aérea foi aplicada para reduzir o consumo.")
     
