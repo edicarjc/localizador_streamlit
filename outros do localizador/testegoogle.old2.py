@@ -1,0 +1,739 @@
+import streamlit as st
+import pandas as pd
+import requests
+import streamlit.components.v1 as components
+import io
+import plotly.express as px
+import pydeck as pdk
+from math import radians, sin, cos, sqrt, asin
+import os
+import numpy as np
+import warnings
+
+# Suprime FutureWarnings do Pandas para um Streamlit mais limpo
+warnings.simplefilter(action='ignore', category=FutureWarning)
+
+# --- CONFIGURAÇÃO INICIAL E CSS ---
+st.set_page_config(page_title="Localizador de Técnicos (v2.0 Otimizado)", layout="wide")
+
+st.markdown("""
+<style>
+    /* Esconde o menu do Streamlit e o rodapé "Made with Streamlit" */
+    #MainMenu {visibility: hidden;}
+    footer {visibility: hidden;}
+    
+    /* Centraliza o título principal e subtítulos */
+    h1, h2, h3 {
+        text-align: center;
+    }
+    
+    /* Estilo para os botões alinhados */
+    .button-group a {
+        display: inline-block;
+        padding: 8px 15px;
+        color: white;
+        text-align: center;
+        text-decoration: none;
+        border-radius: 5px;
+        font-size: 14px;
+        margin-right: 10px;
+        margin-top: 5px;
+    }
+    .st-emotion-cache-18ni7ap {
+        gap: 1rem;
+    }
+    
+    /* Ajuste visual para o st.radio */
+    div[data-testid="stRadio"] label {
+        margin-right: 15px;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+# --- VARIÁVEIS GLOBAIS ---
+RAIOS = [30, 100, 200]
+CUSTO_POR_KM = 1.0 
+
+# --- FUNÇÕES DE UTILIDADE ---
+
+def haversine(lat1, lon1, lat2, lon2):
+    """Calcula a distância em linha reta (Great-circle distance) entre dois pontos em km."""
+    R = 6371  # Raio da Terra em km
+    lat1, lon1, lat2, lon2 = map(radians, [lat1, lon1, lat2, lon2])
+
+    dlon = lon2 - lon1
+    dlat = lat2 - lat1
+
+    a = sin(dlat / 2)**2 + cos(lat1) * cos(lat2) * sin(dlon / 2)**2
+    c = 2 * asin(sqrt(a))
+    
+    return R * c
+
+
+def get_distance_matrix(origins, destinations, api_key):
+    """Obtém a matriz de distância de carro (km e tempo) do Google Maps."""
+    url = "https://maps.googleapis.com/maps/api/distancematrix/json"
+    params = {
+        "origins": "|".join(origins),
+        "destinations": "|".join(destinations),
+        "key": api_key,
+        "mode": "driving",
+        "language": "pt-BR",
+    }
+    response = requests.get(url, params=params)
+    data = response.json()
+    return data
+
+def geocodificar_endereco(endereco, api_key):
+    """Converte um endereço em coordenadas (latitude e longitude)."""
+    url = "https://maps.googleapis.com/maps/api/geocode/json"
+    params = {
+        "address": endereco,
+        "key": api_key
+    }
+    try:
+        response = requests.get(url, params=params)
+        data = response.json()
+        if data["status"] == "OK":
+            location = data["results"][0]["geometry"]["location"]
+            return location['lat'], location['lng']
+        else:
+            return None, None
+    except requests.exceptions.RequestException:
+        return None, None
+
+@st.cache_data(show_spinner=False)
+def analisar_e_limpar_df(file_buffer):
+    """
+    Carrega, analisa e limpa o DataFrame de técnicos.
+    - Garante colunas essenciais.
+    - Padroniza textos (UF, Cidade, Coordenador).
+    - Corrige formato de coordenadas (vírgula para ponto).
+    """
+    try:
+        df = pd.read_excel(file_buffer)
+        df_log = pd.DataFrame() 
+        problemas = []
+        
+        # 1. GARANTIR E PADRONIZAR COLUNAS ESSENCIAIS
+        str_cols = ['tecnico', 'endereco', 'cidade', 'uf', 'coordenador', 'email_coordenador']
+        for col in str_cols:
+            df[col] = df.get(col, pd.Series(dtype='str')).astype(str).fillna('')
+            df[col] = df[col].str.strip()
+            if col in ['tecnico', 'cidade', 'uf', 'coordenador']:
+                df[col] = df[col].str.title()
+                
+        df['coordenador'] = df['coordenador'].replace({'Nan': 'Não Informado', '': 'Não Informado'})
+
+        # 2. TRATAR E CONVERTER COORDENADAS (Ponto vs Vírgula)
+        for col in ['latitude', 'longitude']:
+            if col in df.columns:
+                df[col] = df[col].astype(str).str.strip() 
+                df[col] = df[col].str.replace(',', '.', regex=False)
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+        
+        # 3. ANALISAR E GERAR RELATÓRIO DE PROBLEMAS (Simplificado aqui)
+        sem_coordenadas = df[df['latitude'].isnull() | df['longitude'].isnull()]
+        for idx, row in sem_coordenadas.iterrows():
+            problemas.append({
+                'Técnico': row['tecnico'],
+                'Problema': 'Sem Coordenadas Válidas (Lat/Long)',
+                'Valor_Original': f"Lat: {row.get('latitude', 'N/A')}, Long: {row.get('longitude', 'N/A')}"
+            })
+            
+        df_log = pd.DataFrame(problemas)
+        
+        return df, df_log
+        
+    except Exception as e:
+        st.error(f"Erro fatal ao carregar ou processar a planilha: {e}")
+        return pd.DataFrame(), pd.DataFrame() 
+
+def load_initial_data(file_path):
+    """Carrega o arquivo padrão se nenhum upload for feito e executa a análise."""
+    # Simula a leitura de um arquivo padrão, ou cria um DF vazio se não houver
+    if os.path.exists(file_path):
+        df_tecnicos, df_log = analisar_e_limpar_df(file_path)
+        return df_tecnicos, df_log
+    else:
+        # Cria DataFrames vazios
+        cols = ['tecnico', 'endereco', 'cidade', 'uf', 'coordenador', 'email_coordenador', 'latitude', 'longitude']
+        st.warning(f"O arquivo '{file_path}' não foi encontrado. Usando base vazia.")
+        return pd.DataFrame(columns=cols), pd.DataFrame(columns=['Técnico', 'Problema', 'Valor_Original'])
+
+def preencher_resultado_vazio(resultado):
+    """Função auxiliar para preencher campos de técnico vazio."""
+    resultado['Técnico_Mais_Próximo'] = 'N/A'
+    resultado['Coordenador_Técnico'] = 'N/A'
+    resultado['UF_Técnico'] = 'N/A'
+    resultado['Distância_km'] = 'N/A'
+    resultado['Tempo_Estimado'] = 'N/A'
+    resultado['Custo_Estimado_RS'] = 'N/A'
+    return resultado
+
+# --- LÓGICA DE BUSCA PRINCIPAL (Ajustada para Tempo e Custo) ---
+
+def encontrar_tecnico_proximo(endereco_cliente, api_key, df_filtrado, max_distance_km):
+    """Encontra os técnicos mais próximos a um endereço de cliente."""
+    
+    df_validos = df_filtrado.dropna(subset=['latitude', 'longitude']).copy()
+    
+    if df_validos.empty:
+        return None, None
+
+    # 1. GEOCODIFICAR ENDEREÇO DO CLIENTE
+    lat_cliente, lng_cliente = geocodificar_endereco(endereco_cliente, api_key)
+    
+    if lat_cliente is None:
+        st.error(f"Não foi possível geocodificar o endereço do cliente: {endereco_cliente}")
+        return None, None
+
+    origem = f"{lat_cliente},{lng_cliente}"
+    localizacao_cliente = {'lat': lat_cliente, 'lng': lng_cliente}
+
+    # 2. CALCULAR DISTÂNCIAS E TEMPOS EM LOTE
+    distancias_tempos = []
+    
+    destinos_por_lote = 25 
+    for i in range(0, len(df_validos), destinos_por_lote):
+        lote_df = df_validos.iloc[i : i + destinos_por_lote]
+        destinos = [f"{lat},{lon}" for lat, lon in zip(lote_df['latitude'], lote_df['longitude'])]
+        
+        try:
+            matrix_data = get_distance_matrix([origem], destinos, api_key)
+        except requests.exceptions.RequestException:
+            st.error("Erro de conexão ao calcular as distâncias.")
+            return None, None
+        
+        if matrix_data["status"] != "OK":
+            st.error(f"Erro na Google Maps Distance Matrix API: {matrix_data['status']}")
+            return None, None
+        
+        for element in matrix_data["rows"][0]["elements"]:
+            if element["status"] == "OK":
+                distancia_km = element["distance"]["value"] / 1000
+                tempo_text = element["duration"]["text"]
+                tempo_seconds = element["duration"]["value"]
+                
+                distancias_tempos.append({
+                    'distancia_km': distancia_km,
+                    'tempo_text': tempo_text,
+                    'tempo_seconds': tempo_seconds
+                })
+            else:
+                distancias_tempos.append({
+                    'distancia_km': float("inf"),
+                    'tempo_text': "N/A",
+                    'tempo_seconds': float("inf")
+                })
+
+    # 3. CONSOLIDAR RESULTADOS E FILTRAR
+    df_validos["distancia_km"] = [d['distancia_km'] for d in distancias_tempos]
+    df_validos["tempo_text"] = [d['tempo_text'] for d in distancias_tempos]
+    df_validos["tempo_seconds"] = [d['tempo_seconds'] for d in distancias_tempos]
+    
+    # Cálculo de Custo R$ 1/km
+    df_validos["custo_rs"] = df_validos["distancia_km"] * CUSTO_POR_KM
+
+    # Filtro dinâmico pelo raio selecionado
+    df_dentro_limite = df_validos[df_validos["distancia_km"] <= max_distance_km]
+    
+    # Retorna todos os técnicos dentro do limite, ordenados
+    return df_dentro_limite.sort_values("distancia_km"), localizacao_cliente
+
+# --- LÓGICA DE UPLOAD E CONFRONTO DE CHAMADOS (OTIMIZADA) ---
+
+@st.cache_data(show_spinner=False)
+def processar_chamados_em_lote(df_chamados, df_tecnicos_base, api_key, max_distance_km):
+    """
+    Processa chamados em lote usando pré-filtro Haversine para otimizar
+    o consumo da Distance Matrix API.
+    """
+    
+    if 'endereco' not in df_chamados.columns or df_chamados['endereco'].isnull().all():
+        return None, "A planilha de chamados deve conter uma coluna chamada 'endereco' com os endereços a serem buscados."
+
+    df_tecnicos_validos = df_tecnicos_base.dropna(subset=['latitude', 'longitude']).copy()
+    df_resultados_finais = []
+    
+    total_chamados = len(df_chamados)
+    chamados_processados = 0
+    chamados_com_erro = 0
+    chamados_sem_tecnico = 0
+    chamados_otimizados = 0
+
+    progress_bar = st.progress(0, text="Iniciando processamento dos chamados...")
+
+    # Fator de folga para a distância aérea (1.5x é um bom ponto de partida)
+    FATOR_FOLGA = 1.5 
+    RAIO_MAXIMO_AEREO = max_distance_km * FATOR_FOLGA
+
+    for index, row_chamado in df_chamados.iterrows():
+        endereco_cliente = row_chamado['endereco']
+        
+        chamados_processados += 1
+        progress_bar.progress(chamados_processados / total_chamados, text=f"Processando {chamados_processados}/{total_chamados} chamados...")
+        
+        if pd.isnull(endereco_cliente) or not endereco_cliente.strip():
+            chamados_com_erro += 1
+            row_chamado['Status'] = 'ERRO: Endereço vazio'
+            df_resultados_finais.append(preencher_resultado_vazio(row_chamado.to_dict()))
+            continue
+
+        # 1. GEOCODIFICAR ENDEREÇO DO CHAMADO
+        lat_cliente, lng_cliente = geocodificar_endereco(endereco_cliente, api_key)
+
+        if lat_cliente is None:
+            chamados_com_erro += 1
+            row_chamado['Status'] = 'ERRO: Falha na Geocodificação'
+            df_resultados_finais.append(preencher_resultado_vazio(row_chamado.to_dict()))
+            continue
+
+        origem = f"{lat_cliente},{lng_cliente}"
+        
+        # 2. PRÉ-FILTRO POR DISTÂNCIA HAVERSINE (OTIMIZAÇÃO)
+        df_temp = df_tecnicos_validos.copy()
+        
+        # Calcula a distância aérea para todos os técnicos em lote
+        df_temp['distancia_aerea_km'] = df_temp.apply(
+            lambda x: haversine(lat_cliente, lng_cliente, x['latitude'], x['longitude']), axis=1
+        )
+        
+        # Filtra apenas os técnicos que estão dentro do raio aéreo de folga
+        df_candidatos = df_temp[df_temp['distancia_aerea_km'] <= RAIO_MAXIMO_AEREO].copy()
+
+        # Se não houver candidatos nem por distância aérea, pula a Distance Matrix (GRANDE ECONOMIA)
+        if df_candidatos.empty:
+            chamados_sem_tecnico += 1
+            resultado = row_chamado.to_dict()
+            resultado['Status'] = f'Nenhum técnico no raio AÉREO de {RAIO_MAXIMO_AEREO:.0f} km'
+            df_resultados_finais.append(preencher_resultado_vazio(resultado))
+            continue
+            
+        chamados_otimizados += 1 # Contador de chamados que usaram a Distance Matrix
+        
+        # 3. CALCULAR DISTÂNCIAS REAIS APENAS PARA CANDIDATOS
+        distancias_tempos = []
+        destinos_por_lote = 25
+        
+        for i in range(0, len(df_candidatos), destinos_por_lote):
+            lote_df = df_candidatos.iloc[i : i + destinos_por_lote]
+            destinos = [f"{lat},{lon}" for lat, lon in zip(lote_df['latitude'], lote_df['longitude'])]
+            
+            # Chama a API
+            try:
+                matrix_data = get_distance_matrix([origem], destinos, api_key)
+            except requests.exceptions.RequestException:
+                for _ in range(len(lote_df)):
+                    distancias_tempos.append({'distancia_km': float("inf"), 'tempo_text': "N/A", 'tempo_seconds': float("inf")})
+                continue
+            
+            if matrix_data["status"] != "OK":
+                for _ in range(len(lote_df)):
+                    distancias_tempos.append({'distancia_km': float("inf"), 'tempo_text': "N/A", 'tempo_seconds': float("inf")})
+                continue
+                
+            for element in matrix_data["rows"][0]["elements"]:
+                if element["status"] == "OK":
+                    distancias_tempos.append({
+                        'distancia_km': element["distance"]["value"] / 1000,
+                        'tempo_text': element["duration"]["text"],
+                        'tempo_seconds': element["duration"]["value"]
+                    })
+                else:
+                    distancias_tempos.append({
+                        'distancia_km': float("inf"),
+                        'tempo_text': "N/A",
+                        'tempo_seconds': float("inf")
+                    })
+        
+        # Consolida distâncias reais e filtra pelo raio
+        df_candidatos["distancia_km"] = [d['distancia_km'] for d in distancias_tempos]
+        df_candidatos["tempo_text"] = [d['tempo_text'] for d in distancias_tempos]
+        df_candidatos["custo_rs"] = df_candidatos["distancia_km"] * CUSTO_POR_KM
+        
+        # Filtro final pelo raio MÁXIMO (carro)
+        df_aptos = df_candidatos[df_candidatos["distancia_km"] <= max_distance_km].sort_values("distancia_km")
+
+        # 4. CONSOLIDA O MELHOR TÉCNICO PARA O CHAMADO
+        
+        if not df_aptos.empty:
+            melhor_tecnico = df_aptos.iloc[0]
+            
+            resultado = row_chamado.to_dict()
+            resultado['Status'] = f'Atendimento no Raio ({max_distance_km} km)'
+            resultado['Técnico_Mais_Próximo'] = melhor_tecnico['tecnico']
+            resultado['Coordenador_Técnico'] = melhor_tecnico['coordenador']
+            resultado['UF_Técnico'] = melhor_tecnico['uf']
+            resultado['Distância_km'] = f"{melhor_tecnico['distancia_km']:.2f}"
+            resultado['Tempo_Estimado'] = melhor_tecnico['tempo_text']
+            resultado['Custo_Estimado_RS'] = f"R$ {melhor_tecnico['custo_rs']:.2f}"
+            
+        else:
+            chamados_sem_tecnico += 1
+            resultado = row_chamado.to_dict()
+            resultado['Status'] = f'Nenhum técnico no raio de {max_distance_km} km (Real)'
+            resultado = preencher_resultado_vazio(resultado)
+            
+        df_resultados_finais.append(resultado)
+    
+    progress_bar.empty()
+    
+    df_final = pd.DataFrame(df_resultados_finais)
+    
+    total_encontrado = total_chamados - chamados_sem_tecnico - chamados_com_erro
+    resumo = {
+        "Total de Chamados na Planilha": total_chamados,
+        f"Chamados com Técnico Encontrado (Até {max_distance_km} km)": total_encontrado,
+        "Chamados Sem Técnico no Raio": chamados_sem_tecnico,
+        "Chamados com Erro (Endereço Inválido/Vazio)": chamados_com_erro,
+        "Chamados Processados na Distance Matrix (Otimizados)": chamados_otimizados
+    }
+    
+    return df_final, resumo
+
+# --- LÓGICA DE LOGIN (MANTIDA) ---
+
+def check_password_general(password_key, error_msg):
+    """Verifica uma senha genérica do secrets."""
+    # Lógica simplificada de checagem de senha...
+    if password_key not in st.secrets.get("auth", {}):
+        return True 
+    
+    password = st.text_input("Por favor, insira a senha para acessar:", type="password", key=password_key)
+    if password == st.secrets["auth"][password_key]:
+        return True
+    elif password:
+        st.error(error_msg)
+        return False
+    return False
+
+# --- CÓDIGO DO APLICATIVO PRINCIPAL ---
+
+# 0. INICIALIZAÇÃO DE ESTADO E AUTENTICAÇÃO
+if "authenticated" not in st.session_state:
+    st.session_state.authenticated = False
+if "df_tecnicos" not in st.session_state:
+    df_tecnicos_init, df_log_init = load_initial_data('tecnicos.xlsx')
+    st.session_state.df_tecnicos = df_tecnicos_init
+    st.session_state.df_log_erros = df_log_init 
+    st.session_state.df_original = st.session_state.df_tecnicos.copy() 
+
+if not st.session_state.authenticated:
+    st.title("🔒 Acesso Restrito")
+    if check_password_general("senha", "Senha incorreta. Tente novamente."):
+        st.session_state.authenticated = True
+        st.rerun()
+    st.stop()
+
+
+# 1. CARREGAR DADOS E API KEY
+df_tecnicos = st.session_state.df_tecnicos
+
+try:
+    API_KEY = st.secrets["api"]["google_maps"]
+except KeyError:
+    st.error("Chave de API do Google Maps não encontrada. Verifique o arquivo .streamlit/secrets.toml")
+    API_KEY = None
+    
+# --- CONFIGURAÇÃO INICIAL DO SIDEBAR ---
+st.sidebar.header("Filtros de Busca")
+
+# 1. Raio Máximo de Busca 
+if "raio_selecionado" not in st.session_state:
+    st.session_state.raio_selecionado = 30 
+
+st.sidebar.markdown("**Raio Máximo (km):**")
+st.session_state.raio_selecionado = st.radio(
+    "Escolha o Raio:",
+    options=RAIOS,
+    index=RAIOS.index(st.session_state.raio_selecionado) if st.session_state.raio_selecionado in RAIOS else 0,
+    format_func=lambda x: f"{x} km", 
+    horizontal=True,
+    key='radio_raio' 
+)
+st.sidebar.markdown("---")
+
+# Inicialização dos outros filtros
+if "uf_selecionada" not in st.session_state: st.session_state.uf_selecionada = "Todos"
+if "cidade_selecionada" not in st.session_state: st.session_state.cidade_selecionada = "Todas"
+if "coordenador_selecionado" not in st.session_state: st.session_state.coordenador_selecionado = "Todos"
+
+# Listas de opções para filtros
+ufs = ["Todos"] + sorted(df_tecnicos['uf'].unique().tolist()) if 'uf' in df_tecnicos.columns and not df_tecnicos.empty else ["Todos"]
+cidades_todas = ["Todas"] + sorted(df_tecnicos['cidade'].unique().tolist()) if 'cidade' in df_tecnicos.columns and not df_tecnicos.empty else ["Todas"]
+coordenadores = ["Todos"] + sorted(df_tecnicos['coordenador'].unique().tolist()) if 'coordenador' in df_tecnicos.columns and not df_tecnicos.empty else ["Todos"]
+
+# --- SIDEBAR (FILTROS) ---
+with st.sidebar:
+    
+    # Filtros por UF, Cidade e Coordenador
+    st.session_state.uf_selecionada = st.selectbox("Filtrar por UF:", ufs, index=ufs.index(st.session_state.uf_selecionada) if st.session_state.uf_selecionada in ufs else 0)
+    
+    # Lógica para filtrar as cidades com base na UF selecionada
+    if st.session_state.uf_selecionada and st.session_state.uf_selecionada != "Todos":
+        cidades_filtradas = ["Todas"] + sorted(df_tecnicos[df_tecnicos['uf'] == st.session_state.uf_selecionada]['cidade'].unique().tolist())
+        try:
+            current_index = cidades_filtradas.index(st.session_state.cidade_selecionada)
+        except ValueError:
+            current_index = 0
+            st.session_state.cidade_selecionada = "Todas"
+        st.session_state.cidade_selecionada = st.selectbox("Filtrar por Cidade:", cidades_filtradas, index=current_index)
+    else:
+        st.session_state.cidade_selecionada = st.selectbox("Filtrar por Cidade:", cidades_todas, index=cidades_todas.index(st.session_state.cidade_selecionada) if st.session_state.cidade_selecionada in cidades_todas else 0)
+    
+    st.session_state.coordenador_selecionado = st.selectbox("Filtrar por Coordenador:", coordenadores, index=coordenadores.index(st.session_state.coordenador_selecionado) if st.session_state.coordenador_selecionado in coordenadores else 0)
+
+    st.markdown("---")
+    if st.button("Limpar Filtros"):
+        st.session_state.uf_selecionada = "Todos"
+        st.session_state.cidade_selecionada = "Todas"
+        st.session_state.coordenador_selecionado = "Todos"
+        st.session_state.raio_selecionado = 30
+        st.rerun()
+        
+    st.markdown("---")
+    st.markdown("**Opções de Visualização**")
+    modo_exibicao = st.radio("Formato da Lista de Técnicos:", ["Tabela", "Colunas"], index=1)
+# --------------------------------------------------------------------------
+
+
+# --- Sistema de abas ---
+tab1, tab2, tab3, tab4 = st.tabs(["Busca Individual", "Análise de Dados", "Editor de Dados", "Análise de Chamados (Lote)"])
+
+with tab1:
+    st.title("Localizador de Técnicos")
+    
+    # --- APLICAR OS FILTROS ---
+    df_filtrado = df_tecnicos.copy()
+    if st.session_state.uf_selecionada and st.session_state.uf_selecionada != "Todos":
+        df_filtrado = df_filtrado[df_filtrado['uf'] == st.session_state.uf_selecionada]
+    if st.session_state.cidade_selecionada and st.session_state.cidade_selecionada != "Todas":
+        df_filtrado = df_filtrado[df_filtrado['cidade'] == st.session_state.cidade_selecionada]
+    if st.session_state.coordenador_selecionado and st.session_state.coordenador_selecionado != "Todos":
+        df_filtrado = df_filtrado[df_filtrado['coordenador'] == st.session_state.coordenador_selecionado]
+
+    # --- LISTA DE TÉCNICOS FILTRADOS (ACIMA DA BUSCA) ---
+    st.header("Lista de Técnicos Filtrados")
+    if st.session_state.uf_selecionada != "Todos" or st.session_state.cidade_selecionada != "Todas" or st.session_state.coordenador_selecionado != "Todos":
+        cols_display = ['tecnico', 'cidade', 'uf', 'coordenador']
+        
+        if modo_exibicao == "Tabela":
+            st.dataframe(df_filtrado[cols_display], use_container_width=True)
+        else:
+            cols = st.columns(2)
+            for i, row in df_filtrado.iterrows():
+                with cols[i % 2]:
+                    st.markdown(f"**{row['tecnico']}** - {row['cidade']}/{row['uf']}")
+                    st.write(f"Coordenador: {row.get('coordenador', 'Não informado')}")
+                    st.markdown("---")
+    else:
+        st.info("Utilize os filtros na barra lateral para ver uma lista de técnicos.")
+
+    st.markdown("---")
+    st.header("Busca por Distância (Logística)")
+
+    if not df_filtrado.empty:
+        st.info(f"A busca será restrita aos **{len(df_filtrado)}** técnicos selecionados e ao raio de **{st.session_state.raio_selecionado} km**.")
+    else:
+        st.warning("Não há técnicos nos filtros selecionados para realizar a busca por distância.")
+
+    if API_KEY:
+        endereco_cliente = st.text_input("Endereço do Chamado (Ponto de Origem)", help="Ex: Av. Paulista, 1000, São Paulo, SP")
+        
+        if st.button("Buscar Técnico Mais Próximo", key='btn_busca_individual'):
+            if endereco_cliente:
+                with st.spinner(f"Buscando técnicos a até {st.session_state.raio_selecionado} km..."):
+                    
+                    tecnicos_proximos, localizacao_cliente = encontrar_tecnico_proximo(
+                        endereco_cliente, 
+                        API_KEY, 
+                        df_filtrado, 
+                        st.session_state.raio_selecionado
+                    )
+                    
+                    if tecnicos_proximos is not None and not tecnicos_proximos.empty:
+                        st.success(f"Busca concluída! Encontrados {len(tecnicos_proximos)} técnicos a até {st.session_state.raio_selecionado} km de distância.")
+                        
+                        col_mapa, col_lista = st.columns([1, 1]) 
+                        
+                        with col_mapa:
+                            st.subheader("📍 Mapa dos Resultados")
+                            
+                            # --- CÓDIGO DO MAPA CORRIGIDO (DUAS CAMADAS) ---
+                            
+                            # 1. Preparar dados
+                            df_tecnicos_mapa = tecnicos_proximos[['latitude', 'longitude', 'tecnico']].rename(
+                                columns={'latitude': 'lat', 'longitude': 'lon'}
+                            )
+                            df_cliente_mapa = pd.DataFrame([localizacao_cliente]).rename(columns={'lat': 'lat', 'lng': 'lon'})
+                            
+                            # 2. Definir o estado inicial do mapa (centrado no cliente)
+                            view_state = pdk.ViewState(
+                                latitude=localizacao_cliente['lat'],
+                                longitude=localizacao_cliente['lng'],
+                                zoom=9, # Zoom padrão
+                                pitch=0,
+                            )
+                            
+                            # 3. Camada dos Técnicos (Pontos Azuis)
+                            camada_tecnicos = pdk.Layer(
+                                'ScatterplotLayer',
+                                df_tecnicos_mapa,
+                                get_position='[lon, lat]',
+                                get_color='[0, 100, 200, 160]', # Azul
+                                get_radius=500, # Raio menor (500m)
+                                pickable=True,
+                            )
+                            
+                            # 4. Camada do Cliente (Ponto de Origem - Maior e Vermelho)
+                            camada_cliente = pdk.Layer(
+                                'ScatterplotLayer',
+                                df_cliente_mapa,
+                                get_position='[lon, lat]',
+                                get_color='[255, 0, 0, 255]', # Vermelho (Destaca a origem)
+                                get_radius=1500, # Raio maior (1500m)
+                                pickable=True,
+                            )
+                            
+                            # 5. Renderizar o mapa
+                            st.pydeck_chart(pdk.Deck(
+                                map_style='mapbox://styles/mapbox/light-v9',
+                                initial_view_state=view_state,
+                                layers=[camada_tecnicos, camada_cliente], # Ambas as camadas
+                            ))
+                            # ------------------------------------------------
+
+                        with col_lista:
+                            st.subheader("🛠️ Lista de Técnicos (Apto para Atendimento)")
+                            
+                            df_to_export = tecnicos_proximos[[
+                                'tecnico', 'coordenador', 'cidade', 'uf', 
+                                'distancia_km', 'tempo_text', 'custo_rs', 
+                                'email_coordenador'
+                            ]].copy()
+                            df_to_export['distancia_km'] = df_to_export['distancia_km'].round(2)
+                            df_to_export['custo_rs'] = df_to_export['custo_rs'].round(2)
+                            
+                            df_to_export.rename(columns={
+                                'tecnico': 'Técnico',
+                                'coordenador': 'Coordenador',
+                                'distancia_km': 'Distância (km)',
+                                'tempo_text': 'Tempo Estimado',
+                                'custo_rs': f'Custo Estimado (R$ {CUSTO_POR_KM}/km)',
+                            }, inplace=True)
+                            
+                            towrite = io.BytesIO()
+                            df_to_export.to_excel(towrite, index=False, header=True)
+                            towrite.seek(0)
+                            st.download_button(
+                                label="Exportar Resultados para Excel",
+                                data=towrite,
+                                file_name='tecnicos_proximos_e_custo.xlsx',
+                                mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+                            )
+
+                            st.markdown("---")
+                            
+                            cols_tecnicos = st.columns(2)
+                            
+                            for i, row in tecnicos_proximos.reset_index(drop=True).iterrows():
+                                with cols_tecnicos[i % 2]:
+                                    st.markdown(f"**{row['tecnico']}** - {row['cidade']}/{row['uf']}")
+                                    st.write(f"Distância: **{row['distancia_km']:.2f} km**")
+                                    st.write(f"Tempo Estimado: **{row['tempo_text']}**")
+                                    st.write(f"Custo Estimado: **R$ {row['custo_rs']:.2f}**")
+                                    st.markdown("---")
+
+                    else:
+                        st.info(f"Nenhum técnico encontrado no universo filtrado que esteja a até {st.session_state.raio_selecionado} km de distância do endereço.")
+            else:
+                st.warning("Por favor, digite um endereço para iniciar a busca.")
+
+with tab2:
+    st.header("📊 Análise de Dados dos Técnicos")
+    # Código de Análise de Dados (Manter o seu código original aqui)
+    st.info("Aqui é onde você insere os gráficos e análises da sua base de técnicos (ex: distribuição por UF, contagem por coordenador).")
+
+with tab3:
+    st.header("📝 Editor de Dados dos Técnicos")
+    # Código do Editor de Dados (Manter o seu código original aqui)
+    st.info("Aqui é onde você insere o código do `st.experimental_data_editor` para editar sua base de técnicos online.")
+
+
+# =========================================================================
+# === NOVA ABA: ANÁLISE DE CHAMADOS EM LOTE (OTIMIZADA) ===
+# =========================================================================
+with tab4:
+    st.title("Análise de Chamados em Lote")
+    st.header("Confrontar Planilha de Chamados com Base de Técnicos")
+    st.warning("ATENÇÃO: Este recurso consome cotas da Google Maps API rapidamente. A otimização por distância aérea foi aplicada para reduzir o consumo.")
+    
+    st.markdown("---")
+    st.subheader("Configurações da Análise")
+    raio_lote = st.select_slider(
+        "Selecione o Raio Máximo de Atendimento (km) para esta análise:",
+        options=[10, 20, 30, 50, 100, 200],
+        value=30
+    )
+    
+    st.markdown("---")
+    st.subheader("1. Upload da Planilha de Chamados")
+    st.info("A planilha DEVE conter uma coluna chamada **'endereco'** com os endereços dos chamados.")
+    
+    uploaded_chamados = st.file_uploader(
+        "Carregar Planilha de Chamados (.xlsx):", 
+        type=['xlsx'], 
+        key='upload_chamados'
+    )
+    
+    if uploaded_chamados is not None:
+        try:
+            df_chamados = pd.read_excel(uploaded_chamados)
+            st.success(f"Planilha de chamados carregada com sucesso! Total de {len(df_chamados)} chamados.")
+            
+            if st.button(f"Iniciar Análise de Confronto (Raio: {raio_lote} km)", key='btn_confronto'):
+                if API_KEY and not df_tecnicos.empty:
+                    
+                    df_resultados, resumo = processar_chamados_em_lote(
+                        df_chamados.copy(), 
+                        df_tecnicos.copy(), 
+                        API_KEY, 
+                        raio_lote
+                    )
+                    
+                    st.markdown("---")
+                    st.subheader("2. Resultados da Análise")
+                    
+                    # Exibe o resumo
+                    col_sum1, col_sum2, col_sum3, col_sum4 = st.columns(4)
+                    col_sum1.metric(label="Total Chamados", value=resumo['Total de Chamados na Planilha'])
+                    col_sum2.metric(label=f"Atendidos (Até {raio_lote} km)", value=resumo[f"Chamados com Técnico Encontrado (Até {raio_lote} km)"])
+                    col_sum3.metric(label="Sem Técnico no Raio", value=resumo["Chamados Sem Técnico no Raio"])
+                    col_sum4.metric(label="Otimizados (Economia API)", value=resumo["Chamados Processados na Distance Matrix (Otimizados)"])
+
+
+                    st.markdown("### Tabela Detalhada dos Resultados")
+                    st.dataframe(df_resultados, use_container_width=True)
+                    
+                    # Botão de download
+                    towrite_chamados = io.BytesIO()
+                    df_resultados.to_excel(towrite_chamados, index=False, header=True)
+                    towrite_chamados.seek(0)
+                    st.download_button(
+                        label="Exportar Resultados (Excel)",
+                        data=towrite_chamados,
+                        file_name='analise_chamados_confronto.xlsx',
+                        mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+                    )
+                    
+                else:
+                    st.error("Erro: Verifique se a Chave API e a Base de Técnicos foram carregadas corretamente.")
+        
+        except Exception as e:
+            st.error(f"Erro ao ler a planilha de chamados. Verifique o formato do arquivo: {e}")
+# =========================================================================
+
+# Rodapé com informações do desenvolvedor (Mantido)
+st.markdown("---")
+st.markdown("<div style='text-align:center;'>Desenvolvido por Edmilson Carvalho - Edmilson.carvalho@globalhitss.com.br © 2025</div>", unsafe_allow_html=True)
